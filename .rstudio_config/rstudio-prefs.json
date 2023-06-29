@@ -1,3 +1,4 @@
 {
-    "source_with_echo": true
+    "source_with_echo": true,
+    "jobs_tab_visibility": "shown"
 }
