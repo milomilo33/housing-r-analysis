@@ -1,0 +1,12 @@
+services:
+  rstudio:
+    image: rocker/verse:4.1.0
+    ports:
+      - "8787:8787"
+    environment:
+      PASSWORD: root
+    volumes:
+      - ./.rstudio_config:/home/rstudio/.config/rstudio
+      - ./workspace:/home/rstudio/workspace
+      - ./other_dir:/other_dir
+      - ./install_tar:/install_tar
