@@ -10,6 +10,7 @@ library(ggplot2)
 library(cowplot)
 library(magrittr)
 library(knitr)
+library(scales)
 
 # Install
 sparklyr::spark_install_tar(tarfile ="/install_tar/spark-3.4.0-bin-hadoop3.tgz")
@@ -79,7 +80,7 @@ df <- df %>%
     TRUE ~ 3),
   )
 
-# Label encoding using StringIndexer
+# One-hot encoding
 df <- df %>%
   ft_string_indexer(input_col = "county", output_col = "county_encoded")
 df <- df %>%
@@ -89,6 +90,18 @@ df <- df %>%
   ft_string_indexer(input_col = "district", output_col = "district_encoded")
 df <- df %>%
   ft_one_hot_encoder("district_encoded", "district_encoded2")
+df
+
+df <- df %>%
+  ft_string_indexer(input_col = "duration", output_col = "duration_encoded")
+df <- df %>%
+  ft_one_hot_encoder("duration_encoded", "duration_encoded2")
+df
+
+df <- df %>%
+  ft_string_indexer(input_col = "new_property", output_col = "new_property_encoded")
+df <- df %>%
+  ft_one_hot_encoder("new_property_encoded", "new_property_encoded2")
 df
 
 
@@ -106,7 +119,7 @@ iterator <- 0
 for (num in num.iterations) {
   iterator <- iterator + 1
   lr <- ml_logistic_regression(x = df.split$training,
-                               formula = property_type ~ price + new_property + duration + district_encoded2 + county_encoded2,
+                               formula = property_type ~ price + new_property_encoded2 + duration_encoded2 + district_encoded2 + county_encoded2,
                                max_iter = num, family = "multinomial",
                                handle_invalid = "keep")
   results <- ml_evaluate(lr, df.split$testing)
@@ -152,7 +165,7 @@ plot_grid(lr.acc.plot, lr.prec.plot, lr.rec.plot, lr.f.plot, nrow=2, ncol=2)
 # 2.1. Classification with different model types
 
 # number of folds
-k = 5
+k = 4
 
 # create the weights
 weights <- rep(1 / k, times = k)
@@ -166,7 +179,7 @@ df.models.partitioned <- sdf_partition(
   seed = 2023
 )
 
-models.formula <- property_type ~ price + new_property + duration + district_encoded2 + county_encoded2
+models.formula <- property_type ~ price + new_property_encoded2 + duration_encoded2 + district_encoded2 + county_encoded2
 
 lr.acc <- c()
 random_forest.acc <- c()
@@ -201,6 +214,77 @@ for (i in 1:k) {
   print(decision_tree.acc[i])
 }
 
-print(mean(lr.acc))
-print(mean(random_forest.acc))
-print(mean(decision_tree.acc))
+#print(mean(lr.acc))
+#print(mean(random_forest.acc))
+#print(mean(decision_tree.acc))
+
+models.results.table <- data.frame(logistic_regression_mean_accuracy = mean(lr.acc), 
+                                   random_forest_mean_accuracy = mean(random_forest.acc),
+                                   decision_tree_mean_accuracy = mean(decision_tree.acc))
+models.results.table
+
+
+# 3. Clustering
+
+property_type <- df %>% 
+  select(property_type) %>%
+  collect()
+
+df.clustering <- df %>% 
+  mutate(property_type_numeric = case_when(
+    property_type == "D" ~ 0,
+    property_type == "S" ~ 1,
+    property_type == "T" ~ 2,
+    property_type == "F" ~ 3,
+    property_type == "O" ~ 4,
+    TRUE ~ 5),
+  )
+
+df.clustering <- df.clustering %>% filter(price <= 1000000)
+df.clustering
+
+price.per.type.cluster.k2 <- ml_kmeans(
+  df.clustering,
+  ~ property_type_numeric + price, 
+  k = 2,
+  init_mode = "k-means||")
+price.per.type.cluster.k2
+price.per.type.cluster.k3 <- ml_kmeans(
+  df.clustering,
+  ~ property_type_numeric + price, 
+  k = 3,
+  init_mode = "k-means||")
+price.per.type.cluster.k3
+
+silhouette_measure.k2 <- ml_evaluate(price.per.type.cluster.k2,
+                                      df.clustering %>% select(property_type_numeric, price))
+silhouette_measure.k2
+silhouette_measure.k3 <- ml_evaluate(price.per.type.cluster.k3,
+                                     df.clustering %>% select(property_type_numeric, price))
+silhouette_measure.k3
+
+clustering.results.k2 <- price.per.type.cluster.k2$model$summary$cluster() %>% collect()
+clustering.results.k3 <- price.per.type.cluster.k3$model$summary$cluster() %>% collect()
+
+df.clustering <- df.clustering %>% select(property_type_numeric, price) %>% collect()
+
+df.clustering$cluster_num_k2 <- as.factor(clustering.results.k2$prediction)
+df.clustering$cluster_num_k3 <- as.factor(clustering.results.k3$prediction)
+
+ggplot(data = df.clustering,
+       aes(x = property_type_numeric, y = price, colour = cluster_num_k2)) +
+  geom_jitter(size = 2) +
+  geom_point(data = price.per.type.cluster.k2$centers,
+             aes(x = property_type_numeric, y = price),
+             color = "red",
+             size = 5) +
+  scale_y_continuous(labels = comma)
+
+ggplot(data = df.clustering,
+       aes(x = property_type_numeric, y = price, colour = cluster_num_k3)) +
+  geom_jitter(size = 2) +
+  geom_point(data = price.per.type.cluster.k3$centers,
+             aes(x = property_type_numeric, y = price),
+             color = "red",
+             size = 5) +
+  scale_y_continuous(labels = comma)
