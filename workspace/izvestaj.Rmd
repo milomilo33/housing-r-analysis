@@ -1,0 +1,395 @@
+---
+title: "Izveštaj"
+author: "Milovan Milovanović, E2-119-2022"
+date: "6/30/2023"
+output: html_document
+---
+
+## Uvod
+
+Ovaj dokument ima cilj da opiše celokupan proces analize velikog skupa podataka o prometu stambenih objekata u Ujedinjenom Kraljevstvu. Konkretnije, biće dat detaljniji opis korišćenog skupa podataka, kao i opis postupaka u analizi i obradi tih podataka i rezultati koji su tom prilikom dobijeni.
+
+## Skup podataka
+
+Skup podataka korišćen prilikom analize može se preuzeti [ovde](https://www.gov.uk/government/statistical-data-sets/price-paid-data-downloads). Ovaj skup podataka obuhvata podatke u vezi sa prometom stambenih objekata u UK počev od 1995. godine, pri čemu svaki unos, između ostalog, sadrži identifikator transakcije, cenu, datum transakcije, poštanski kod, tip stambenog objekta, podatke o lokaciji i sl. Detaljniji opis kolona dat je [ovde](https://www.gov.uk/guidance/about-the-price-paid-data). 
+
+Kako postoji izuzetno velik broj podataka, radi olakšanja opterećenja prilikom treniranja podataka i sl. od početnog *CSV* fajla generisan je jedan manji upotrebom sledeće *bash* komande unutar */workspace* direktorijuma projekta:
+
+```{bash eval=F, include=T}
+head -n200000 uk-housing-official-1995-to-2023.csv > 200000.csv
+```
+
+## Inicijalizacija
+
+### Instaliranje paketa
+```{r Installing packages, eval=F, include=T}
+install.packages("sparklyr")
+install.packages("tidyverse")
+install.packages("cowplot")
+```
+
+
+### Učitavanje biblioteka
+```{r Loading libraries, eval=F, include=T}
+library(sparklyr)
+library(tidyverse)
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+library(cowplot)
+library(magrittr)
+library(knitr)
+library(scales)
+```
+
+
+### Priprema Spark okruženja
+
+Neophodno je da se preuzme [ovo](https://downloads.apache.org/spark/spark-3.4.0/spark-3.4.0-bin-hadoop3.tgz) u */install_tar* direktorijum projekta.
+
+```{r Setting up Spark environment, eval=F, include=T}
+# Install
+sparklyr::spark_install_tar(tarfile ="/install_tar/spark-3.4.0-bin-hadoop3.tgz")
+
+# Connect
+sc <- sparklyr::spark_connect(master = "local")
+```
+
+
+### Učitavanje skupa podataka
+```{r Loading dataset, eval=F, include=T}
+pathToDataset <- "~/workspace/200000.csv"
+
+# Load dataset
+df.unfiltered <- spark_read_csv(sc, path = pathToDataset,
+                                header = FALSE,
+                                infer_schema = FALSE,
+                                columns = list(
+                                  transaction_id = "character",
+                                  price = "double",
+                                  date = "timestamp",
+                                  postcode = "character",
+                                  property_type = "character",
+                                  new_property = "character",
+                                  duration = "character",
+                                  PAON = "character",
+                                  SAON = "character",
+                                  street = "character",
+                                  locality = "character",
+                                  town = "character",
+                                  district = "character",
+                                  county = "character",
+                                  ppd = "character",
+                                  record_status = "character"
+                                ))
+```
+
+
+### Čišćenje i neophodne transformacije podataka
+
+U okviru ovoga su isfiltrirani unosi koji imaju nedostajuće ili nevalidne vrednosti i izvršen je *one-hot encoding* relevantnih kategoričkih kolona.
+
+```{r Cleaning and transforming data, eval=F, include=T}
+# Data cleansing and transformation
+df <- df.unfiltered %>% 
+  filter(!is.na(transaction_id) & 
+           !is.na(price) &
+           !is.na(date) &
+           !is.na(postcode) & 
+           !is.na(property_type) & 
+           !is.na(new_property) & 
+           !is.na(duration) & 
+           !is.na(street) & 
+           !is.na(locality) &
+           !is.na(town) & 
+           !is.na(district) & 
+           !is.na(county))
+df
+sparklyr::sdf_nrow(df)
+
+price <- df %>% 
+  select(price) %>%
+  collect()
+
+price.quantiles <- quantile(price$price)
+price.low <- price.quantiles[[2]]
+price.lowerMid <- price.quantiles[[3]]
+price.upperMid <- price.quantiles[[4]]
+price.high <- price.quantiles[[5]]
+
+df <- df %>% 
+  mutate(price_category = case_when(
+    price < price.low ~ 0,
+    price < price.lowerMid ~ 1,
+    price < price.upperMid ~ 2,
+    price < price.high ~ 3,
+    TRUE ~ 3),
+  )
+
+# One-hot encoding
+df <- df %>%
+  ft_string_indexer(input_col = "county", output_col = "county_encoded")
+df <- df %>%
+  ft_one_hot_encoder("county_encoded", "county_encoded2")
+
+df <- df %>%
+  ft_string_indexer(input_col = "district", output_col = "district_encoded")
+df <- df %>%
+  ft_one_hot_encoder("district_encoded", "district_encoded2")
+df
+
+df <- df %>%
+  ft_string_indexer(input_col = "duration", output_col = "duration_encoded")
+df <- df %>%
+  ft_one_hot_encoder("duration_encoded", "duration_encoded2")
+df
+
+df <- df %>%
+  ft_string_indexer(input_col = "new_property", output_col = "new_property_encoded")
+df <- df %>%
+  ft_one_hot_encoder("new_property_encoded", "new_property_encoded2")
+df
+```
+
+## Klasifikacija
+
+### Poređenje performansi pet klasifikacionih modela istog tipa sa različitim parametrima
+
+#### Treniranje modela i tabelarni prikaz
+
+U narednom isečku koda prikazan je postupak treniranja modela linearne regresije na 80% početnog skupa, koji radi višeklasnu klasifikaciju tipa stambenog objekta na osnovu cene i par relevantnih prethodno enkodiranih kategoričkih varijabli. Model se trenira 5 puta sa 5 različitih vrednosti parametra maksimalnog broja iteracija. Nakon treniranja tabelarno se ispisuju rezultati u vidu metrika performansi: tačnost, preciznost, osetljivost i F mera.
+
+```{r Classification with different parameters, eval=F, include=T}
+# 1.1. Classification with different parameters
+
+df.split <- sdf_random_split(df, training = 0.8, testing = 0.2)
+
+num.iterations <- c(3, 6, 10, 50, 100)
+lr.performance.metrics.accuracy <- c(length(num.iterations))
+lr.performance.metrics.weighted_precision <- c(length(num.iterations))
+lr.performance.metrics.weighted_recall <- c(length(num.iterations))
+lr.performance.metrics.weighted_f_measure <- c(length(num.iterations))
+iterator <- 0
+
+for (num in num.iterations) {
+  iterator <- iterator + 1
+  lr <- ml_logistic_regression(x = df.split$training,
+                               formula = property_type ~ price + new_property_encoded2 + duration_encoded2 + district_encoded2 + county_encoded2,
+                               max_iter = num, family = "multinomial",
+                               handle_invalid = "keep")
+  results <- ml_evaluate(lr, df.split$testing)
+  lr.performance.metrics.accuracy[iterator] <- results$accuracy()
+  print(lr.performance.metrics.accuracy[iterator])
+  lr.performance.metrics.weighted_precision[iterator] <- results$weighted_precision()
+  lr.performance.metrics.weighted_recall[iterator] <- results$weighted_recall()
+  lr.performance.metrics.weighted_f_measure[iterator] <- results$weighted_f_measure()
+}
+```
+
+```{r Printing result table, eval=T, include=T}
+lr.results.table <- data.frame(max_iterations = num.iterations, accuracy = lr.performance.metrics.accuracy, 
+                 weighted_precision = lr.performance.metrics.weighted_precision,
+                 weighted_recall = lr.performance.metrics.weighted_recall,
+                 weighted_f_measure = lr.performance.metrics.weighted_f_measure)
+lr.results.table
+```
+
+#### Vizualizacija
+
+Pored tabelarnog prikaza pomenute metrike su vizualizovane u zavisnosti od vrednosti parametra maksimalnog broja iteracija.
+
+```{r Visualizing, eval=T, include=T}
+# 1.2. Visualization
+
+lr.acc.plot <- lr.results.table %>% 
+  ggplot(aes(max_iterations, accuracy)) +
+  geom_line() +
+  geom_point()
+
+lr.prec.plot <- lr.results.table %>% 
+  ggplot(aes(max_iterations, weighted_precision)) +
+  geom_line() +
+  geom_point()
+
+lr.rec.plot <- lr.results.table %>% 
+  ggplot(aes(max_iterations, weighted_recall)) +
+  geom_line() +
+  geom_point()
+
+lr.f.plot <- lr.results.table %>% 
+  ggplot(aes(max_iterations, weighted_f_measure)) +
+  geom_line() +
+  geom_point()
+
+plot_grid(lr.acc.plot, lr.prec.plot, lr.rec.plot, lr.f.plot, nrow=2, ncol=2)
+```
+
+Primećuje se da svaka metrika uživa konzistentan rast sa porastom vrednosti parametra, sve dok ta vrednost ne dostigne 50, kada svaka metrika dostiže vrednost od ~67% za multiklasnu klasifikaciju.
+
+
+### Poređenje performansi triju klasifikaciona modela različitog tipa
+
+#### Kreiranje modela i *k*-tostruka unakrsna validacija
+
+U narednom isečku koda prikazan je postupak pripreme željenog *k* broja particija za unakrsnu validaciju i sam proces validacije unutar petlje. Zavisna i nezavisne varijable su iste kao u prethodnoj klasifikaciji. Izabrani tipovi klasifikacionih modela su linearna regresija, slučajna šuma i stablo odlučivanja. U okviru postupka *k*-tostruke unakrsne validacije svaki model se trenira *k* puta, gde je uvek jedna *1/k* particija upotrebljena kao test skup, a ostale particije su spojene u trening skup.
+
+```{r Classification with different model types, eval=F, include=T}
+# 2.1. Classification with different model types
+
+# number of folds
+k = 4
+
+# create the weights
+weights <- rep(1 / k, times = k)
+
+names(weights) <- paste0("fold", 1:k)
+
+# create the partitioned data
+df.models.partitioned <- sdf_partition(
+  df, 
+  weights = weights, 
+  seed = 2023
+)
+
+models.formula <- property_type ~ price + new_property_encoded2 + duration_encoded2 + district_encoded2 + county_encoded2
+
+lr.acc <- c()
+random_forest.acc <- c()
+decision_tree.acc <- c()
+
+for (i in 1:k) {
+  training.set <- sdf_bind_rows(df.models.partitioned[-i])
+  test.set <- df.models.partitioned[[i]]
+  
+  lr <- ml_logistic_regression(x = training.set,
+                               formula = models.formula,
+                               max_iter = 50, family = "multinomial",
+                               handle_invalid = "keep")
+  lr.results <- ml_evaluate(lr, test.set)
+  lr.acc[i] <- lr.results$accuracy()
+  print(lr.acc[i])
+  
+  random_forest <- ml_random_forest_classifier(x = training.set,
+                               formula = models.formula,
+                               max_depth = 5,
+                               handle_invalid = "keep")
+  random_forest.results <- ml_evaluate(random_forest, test.set)
+  random_forest.acc[i] <- random_forest.results$Accuracy
+  print(random_forest.acc[i])
+  
+  decision_tree <- ml_decision_tree_classifier(x = training.set,
+                                               formula = models.formula,
+                                               max_depth = 5,
+                                               handle_invalid = "keep")
+  decision_tree.results <- ml_evaluate(decision_tree, test.set)
+  decision_tree.acc[i] <- decision_tree.results$Accuracy
+  print(decision_tree.acc[i])
+}
+```
+
+Nakon treniranja tabelarno se ispisuju rezultati validacije u vidu srednje vrednosti metrike tačnosti za svaki model.
+
+```{r Printing result table (models), eval=T, include=T}
+models.results.table <- data.frame(logistic_regression_mean_accuracy = mean(lr.acc), 
+                                   random_forest_mean_accuracy = mean(random_forest.acc),
+                                   decision_tree_mean_accuracy = mean(decision_tree.acc))
+models.results.table
+```
+
+Primećuje se da je model linearne regresije znatno performantniji od preostala dva modela, a model slučajne šume znatno manje performantan čak i od stabla odlučivanja.
+
+
+## Klasterizacija
+
+U ovom poglavlju biće opisana klasterizacija koja je primenjena nad skupom podataka o prometu stambenih objekata. Klasterizacija će prikazivati odnos tipa stambenog objekta i njegove cene.
+
+### Priprema podataka
+
+Kako bi se izvršila klasterizacija, kolona tipa stambenog objekta biće pretvorena u numeričku vrednost. Takođe, biće uklonjeni unosi sa vrednostima cene preko 1 miliona, jer su malobrojni i time se olakšava vizualizacija.
+
+```{r Preparing clustering data, eval=F, include=T}
+property_type <- df %>% 
+  select(property_type) %>%
+  collect()
+
+df.clustering <- df %>% 
+  mutate(property_type_numeric = case_when(
+    property_type == "D" ~ 0,
+    property_type == "S" ~ 1,
+    property_type == "T" ~ 2,
+    property_type == "F" ~ 3,
+    property_type == "O" ~ 4,
+    TRUE ~ 5),
+  )
+
+df.clustering <- df.clustering %>% filter(price <= 1000000)
+df.clustering
+```
+
+### Postupak klasterizacije
+
+U narednom isečku koda prikazan je postupak klasterizacije. Naime, primenjena je *k-means* klasterizacija sa 2 i 3 klastera, respektivno. Ta 2 broja klastera su se pokazala kao najbolja prema *Silhouette* meri u ovom slučaju.
+
+```{r Clustering, eval=F, include=T}
+price.per.type.cluster.k2 <- ml_kmeans(
+  df.clustering,
+  ~ property_type_numeric + price, 
+  k = 2,
+  init_mode = "k-means||")
+price.per.type.cluster.k2
+price.per.type.cluster.k3 <- ml_kmeans(
+  df.clustering,
+  ~ property_type_numeric + price, 
+  k = 3,
+  init_mode = "k-means||")
+price.per.type.cluster.k3
+
+silhouette_measure.k2 <- ml_evaluate(price.per.type.cluster.k2,
+                                      df.clustering %>% select(property_type_numeric, price))
+silhouette_measure.k2
+silhouette_measure.k3 <- ml_evaluate(price.per.type.cluster.k3,
+                                     df.clustering %>% select(property_type_numeric, price))
+silhouette_measure.k3
+
+clustering.results.k2 <- price.per.type.cluster.k2$model$summary$cluster() %>% collect()
+clustering.results.k3 <- price.per.type.cluster.k3$model$summary$cluster() %>% collect()
+
+df.clustering <- df.clustering %>% select(property_type_numeric, price) %>% collect()
+
+df.clustering$cluster_num_k2 <- as.factor(clustering.results.k2$prediction)
+df.clustering$cluster_num_k3 <- as.factor(clustering.results.k3$prediction)
+```
+
+### Vizualizacija
+
+Vizualizacija *k=2* klasterizacije:
+
+```{r Visualizing cluster k2, eval=T, include=T}
+ggplot(data = df.clustering,
+       aes(x = property_type_numeric, y = price, colour = cluster_num_k2)) +
+  geom_jitter(size = 2) +
+  geom_point(data = price.per.type.cluster.k2$centers,
+             aes(x = property_type_numeric, y = price),
+             color = "red",
+             size = 5) +
+  scale_y_continuous(labels = comma)
+```
+
+Primećuje se da je klaster koji obuhvata vrednosti cene od 0 do oko 125000 znatno gušći i centar mu je skoro na sredini x-ose. Ovo znači da najviše prometa ima upravo u okviru ovog klastera i da znatno više "naginje" ka tipovima objekata 2 i 3, odnosno objektima sa terasama i stanovima, u odnosu na klaster koji obuhvata viši cenovni rang i naginje više ka tipu 0 ili 1, odnosno odvojenim ili poluodvojenim objektima (kućama i sl). Konkretno, može se primetiti da je taj klaster najgušći u oblasti tipa 0, što znači da je taj tip najzastupljeniji u transakcijama višeg cenovnog ranga.
+
+Vizualizacija *k=3* klasterizacije:
+
+```{r Visualizing cluster k3, eval=T, include=T}
+ggplot(data = df.clustering,
+       aes(x = property_type_numeric, y = price, colour = cluster_num_k3)) +
+  geom_jitter(size = 2) +
+  geom_point(data = price.per.type.cluster.k3$centers,
+             aes(x = property_type_numeric, y = price),
+             color = "red",
+             size = 5) +
+  scale_y_continuous(labels = comma)
+```
+
+## Zaključak
+
+U ovom radu demonstriran je način na koji je moguće obraditi jedan veći skup podataka upotrebom sistema *Spark*. Primarni fokus rada je bio na sticanju veština rukovanjem programskog jezika *R* i sistema *Spark* u okviru njega u cilju analize i obrade podataka. Primećeno je, svakako, da odabir tipa modela i parametra treniranja ima velik uticaj na kvalitet i uspešnost modela.
